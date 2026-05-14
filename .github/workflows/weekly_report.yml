@@ -1,0 +1,189 @@
+name: Weekly 8-K Intelligence Report
+
+on:
+  schedule:
+    - cron: "0 6 * * 0"   # Every Sunday at 06:00 UTC
+  workflow_dispatch:        # Manual trigger for testing
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: edgar_db
+          POSTGRES_USER: edgar
+          POSTGRES_PASSWORD: edgar_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://edgar:edgar_pass@localhost:5432/edgar_db
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      EDGAR_USER_AGENT: "EDGAR Intelligence github-actions@example.com"
+      REPORTS_DIR: ./reports
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system dependencies (WeasyPrint)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 libpangocairo-1.0-0 libcairo2 \
+            libgdk-pixbuf2.0-0 libffi-dev libssl-dev
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download spaCy model
+        run: python -m spacy download en_core_web_sm
+
+      - name: Apply database schema
+        run: psql $DATABASE_URL -f db/schema.sql
+
+      - name: Ingest latest 8-K filings (last 7 days)
+        run: |
+          python - <<'EOF'
+          import asyncio, os
+          from src.ingestion.edgar_client import EDGARClient, fetch_and_store_filings
+          from sqlalchemy import create_engine
+          from sqlalchemy.orm import sessionmaker
+          from src.ingestion.models import Base
+
+          url = os.environ["DATABASE_URL"]
+          engine = create_engine(url)
+          Base.metadata.create_all(engine)
+          Session = sessionmaker(bind=engine)
+          db = Session()
+
+          client = EDGARClient(os.environ["EDGAR_USER_AGENT"])
+          asyncio.run(fetch_and_store_filings(client, db, days_back=7))
+          db.close()
+          print("Ingestion complete.")
+          EOF
+
+      - name: Run NLP + LLM pipeline on all unprocessed filings
+        run: |
+          python - <<'EOF'
+          import os
+          from sqlalchemy import create_engine
+          from sqlalchemy.orm import sessionmaker
+          from src.ingestion.models import Base, Filing
+          from src.extraction.event_extractor import EventExtractor
+          from src.scoring.materiality_scorer import MaterialityScorer
+          from src.llm.memo_generator import MemoGenerator
+          from src.analysis.thesis_analyzer import ThesisAnalyzer
+          from api.main import _process_filing
+
+          url = os.environ["DATABASE_URL"]
+          engine = create_engine(url)
+          Session = sessionmaker(bind=engine)
+          db = Session()
+
+          filings = db.query(Filing).filter_by(processed=False).all()
+          print(f"Processing {len(filings)} filings...")
+          for f in filings:
+              _process_filing(f, db)
+          db.close()
+          print("Pipeline complete.")
+          EOF
+
+      - name: Compute report date range (last Monday → Sunday)
+        id: dates
+        run: |
+          python - <<'EOF'
+          from datetime import date, timedelta
+          today = date.today()
+          sun = today - timedelta(days=today.weekday() + 1)  # last Sunday
+          mon = sun - timedelta(days=6)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"week_start={mon.isoformat()}\n")
+              f.write(f"week_end={sun.isoformat()}\n")
+          EOF
+          import os
+        shell: python
+
+      - name: Generate weekly PDF report
+        run: |
+          python - <<'EOF'
+          import os
+          from datetime import date
+          from sqlalchemy import create_engine
+          from sqlalchemy.orm import sessionmaker
+          from src.ingestion.models import Filing, Company, MaterialityScore, AnalystMemo
+          from src.reporting.report_generator import generate_weekly_report
+
+          week_start = date.fromisoformat(os.environ["WEEK_START"])
+          week_end   = date.fromisoformat(os.environ["WEEK_END"])
+
+          url = os.environ["DATABASE_URL"]
+          engine = create_engine(url)
+          Session = sessionmaker(bind=engine)
+          db = Session()
+
+          rows = (
+              db.query(Filing, Company, MaterialityScore, AnalystMemo)
+              .join(Company, Filing.company_id == Company.id, isouter=True)
+              .join(MaterialityScore, MaterialityScore.filing_id == Filing.id, isouter=True)
+              .join(AnalystMemo, AnalystMemo.filing_id == Filing.id, isouter=True)
+              .filter(Filing.filing_date.between(week_start, week_end))
+              .order_by(MaterialityScore.score.desc())
+              .all()
+          )
+
+          filings_data = []
+          for filing, company, ms, memo in rows:
+              events = [{"event_type": e.event_type, "summary": e.summary, "confidence": e.confidence}
+                        for e in filing.events]
+              filings_data.append({
+                  "company": company.name if company else "Unknown",
+                  "filing_date": str(filing.filing_date),
+                  "sector": (company.sector or "General") if company else "General",
+                  "score": ms.score if ms else 0,
+                  "severity": ms.severity if ms else "Low",
+                  "thesis": memo.thesis_impact if memo else "Neutral",
+                  "thesis_confidence": memo.thesis_confidence if memo else 0.5,
+                  "thesis_reasoning": memo.thesis_reasoning if memo else "",
+                  "key_factors": [],
+                  "events": events,
+                  "memo": memo.content if memo else "",
+              })
+
+          os.makedirs(os.environ["REPORTS_DIR"], exist_ok=True)
+          out = f"{os.environ['REPORTS_DIR']}/edgar_report_{week_start}_{week_end}.pdf"
+          path = generate_weekly_report(filings_data, week_start, week_end, out)
+          print(f"Report saved: {path}")
+          db.close()
+          EOF
+        env:
+          WEEK_START: ${{ steps.dates.outputs.week_start }}
+          WEEK_END:   ${{ steps.dates.outputs.week_end }}
+
+      - name: Upload PDF report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: edgar-weekly-report-${{ steps.dates.outputs.week_start }}
+          path: reports/*.pdf
+          retention-days: 90
+
+      - name: Summary
+        run: |
+          echo "## EDGAR Intelligence Report" >> $GITHUB_STEP_SUMMARY
+          echo "- **Week:** ${{ steps.dates.outputs.week_start }} → ${{ steps.dates.outputs.week_end }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** PDF generated and uploaded as artifact" >> $GITHUB_STEP_SUMMARY
