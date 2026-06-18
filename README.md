@@ -1,3 +1,5 @@
+Name: R Dhaksesh
+
 # EDGAR Intelligence System
 
 SEC 8-K intelligence pipeline that ingests filings, extracts events with NLP + LLMs, scores materiality, generates analyst memos, and produces weekly PDF research reports.
